@@ -101,6 +101,22 @@ const textOf = (data) => data?.candidates?.[0]?.content?.parts?.map((p) => p.tex
 
 const NOT_FOUND = 'السؤال ده مش موجود في قاعدة البيانات. جرب تكتبه بنفس صيغة الكتاب، أو صوّره بوضوح.';
 
+function geminiFailureMessage(status) {
+  if (status === 401 || status === 403) {
+    return 'تم رفض الوصول إلى Gemini. تحقق من GEMINI_API_KEY ومن تفعيل Gemini API للمشروع المرتبط بالمفتاح.';
+  }
+  if (status === 404) {
+    return 'نموذج Gemini غير موجود أو غير متاح لهذا المفتاح. تحقق من GEMINI_MODEL في إعدادات Vercel.';
+  }
+  if (status === 429) {
+    return 'تم تجاوز حد طلبات Gemini أو الحصة المتاحة. تحقق من الحصة وحاول لاحقاً.';
+  }
+  if (status) {
+    return `تعذر على Gemini معالجة الطلب (HTTP ${status}). راجع سجلات Vercel لمعرفة السبب.`;
+  }
+  return 'تعذر الاتصال بخدمة Gemini. راجع سجلات Vercel لمعرفة السبب.';
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -109,6 +125,7 @@ export default async function handler(req, res) {
     const { imageBase64, mimeType, questionText } = req.body || {};
     const apiKey = process.env.GEMINI_API_KEY;
     const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    let geminiStatus = null;
 
     // 1) نص فقط: مطابقة محلية فورية بدون Gemini
     let local = { best: null, score: 0, margin: 0 };
@@ -151,6 +168,13 @@ ${list}`;
         if (item) return res.status(200).json({ answer: formatAnswer(item), source: 'database' });
         return res.status(200).json({ answer: NOT_FOUND, source: 'database' });
       }
+      geminiStatus = matchRes.status;
+      console.error('Gemini API request failed', {
+        model,
+        httpStatus: matchRes.status,
+        providerStatus: matchRes.data?.error?.status || null,
+        providerCode: matchRes.data?.error?.code || null,
+      });
     }
 
     // 3) Gemini فشل أو مفيش مفتاح: استخدم أقرب سؤال من القاعدة (لو في تطابق معقول)
@@ -162,10 +186,14 @@ ${list}`;
     }
 
     if (imageBase64) {
-      return res.status(503).json({ error: 'السيرفر مزدحم حالياً، جرب مرة تانية بعد ثواني، أو اكتب السؤال نصاً.' });
+      if (!apiKey) {
+        return res.status(503).json({ error: 'مفتاح Gemini غير مضبوط على Vercel. أضف GEMINI_API_KEY ثم أعد النشر.' });
+      }
+      return res.status(503).json({ error: geminiFailureMessage(geminiStatus) });
     }
     return res.status(200).json({ answer: NOT_FOUND, source: 'database' });
   } catch (e) {
+    console.error('API handler failed', { errorName: e?.name || 'Error' });
     return res.status(500).json({ error: 'حدث خطأ داخلي في السيرفر.' });
   }
 }
