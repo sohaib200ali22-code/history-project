@@ -5,7 +5,7 @@ export const config = { maxDuration: 30 };
 const LETTERS = ['أ', 'ب', 'ج', 'د'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------- تطبيع النص العربي ومطابقة محلية سريعة ----------
+// ---------- تطبيع النص العربي ----------
 const normalize = (s = '') =>
   s
     .replace(/[\u064B-\u0652\u0640]/g, '')
@@ -16,50 +16,62 @@ const normalize = (s = '') =>
     .replace(/\s+/g, ' ')
     .trim();
 
-const STOP = new Set(['من', 'في', 'على', 'الي', 'ان', 'ما', 'هو', 'هي', 'ذلك', 'التي', 'الذي', 'عن', 'او', 'مع', 'ثم', 'اي', 'كان', 'قد', 'هذا', 'هذه']);
-const tokens = (s) => normalize(s).split(' ').filter((w) => w.length > 1 && !STOP.has(w));
+// إزالة "ال" و"لل" و"ب" و"و" من أول الكلمة لتوحيد الصيغ (الصوامع = صوامع = لبناء الصوامع)
+const stem = (w) => w.replace(/^(وال|بال|لل|ال|و|ب|ل)(?=.{3,})/, '');
+
+const STOP = new Set(['من', 'في', 'على', 'الي', 'ان', 'ما', 'هو', 'هي', 'ذلك', 'التي', 'الذي', 'عن', 'او', 'مع', 'ثم', 'اي', 'كان', 'قد', 'هذا', 'هذه', 'سبب', 'الرئيسي', 'رئيسي', 'اذكر', 'اشرح', 'علل', 'وضح']);
+const tokens = (s) =>
+  normalize(s)
+    .split(' ')
+    .filter((w) => w.length > 1 && !STOP.has(w))
+    .map(stem);
 
 const ALL = [...MCQ, ...ESSAY];
+const INDEX = ALL.map((item) => ({
+  item,
+  stemSet: new Set(tokens(item.q)),
+  fullSet: new Set(tokens(item.q + ' ' + (item.o ? item.o.join(' ') : ''))),
+}));
 
-function localMatch(text) {
-  const qt = tokens(text);
-  if (qt.length < 3) return null;
-  const qSet = new Set(qt);
-  let best = null;
-  let bestScore = 0;
-  let second = 0;
-  for (const item of ALL) {
-    const st = new Set(tokens(item.q));
-    let hit = 0;
-    for (const w of qSet) if (st.has(w)) hit++;
-    const score = hit / qSet.size;
-    if (score > bestScore) {
-      second = bestScore;
-      bestScore = score;
-      best = item;
-    } else if (score > second) second = score;
-  }
-  // نقبل فقط لو التطابق قوي وواضح
-  return best && bestScore >= 0.75 && bestScore - second >= 0.15 ? best : null;
+// يرجع أفضل سؤال مع درجة التطابق وفرقها عن الثاني
+function rank(text) {
+  const qSet = new Set(tokens(text));
+  if (qSet.size < 1) return { best: null, score: 0, margin: 0 };
+  const scored = INDEX.map(({ item, stemSet, fullSet }) => {
+    let hitStem = 0;
+    let hitFull = 0;
+    for (const w of qSet) {
+      if (stemSet.has(w)) hitStem++;
+      else if (fullSet.has(w)) hitFull++;
+    }
+    return { item, score: (hitStem + 0.6 * hitFull) / qSet.size };
+  }).sort((a, b) => b.score - a.score);
+
+  return {
+    best: scored[0].item,
+    score: scored[0].score,
+    margin: scored[0].score - (scored[1]?.score || 0),
+  };
 }
 
-function formatAnswer(item) {
+function formatAnswer(item, note = '') {
+  const head = note ? `${note}\n\n` : '';
   if (item.o) {
     const i = item.a;
-    return `✅ الإجابة الصحيحة: ${LETTERS[i]}) ${item.o[i]}\n\n📌 رقم السؤال في الكتاب: ${item.id}`;
+    return `${head}❓ السؤال (${item.id}): ${item.q}\n\n✅ الإجابة الصحيحة: ${LETTERS[i]}) ${item.o[i]}`;
   }
-  return `✅ الإجابة النموذجية:\n${item.ans}\n\n📌 رقم السؤال في الكتاب: ${item.id}`;
+  return `${head}❓ السؤال (${item.id}): ${item.q}\n\n✅ الإجابة النموذجية:\n${item.ans}`;
 }
 
-// ---------- استدعاء Gemini مع مهلة وإعادة محاولة ----------
+// ---------- استدعاء Gemini (لتحديد رقم السؤال فقط) ----------
 async function callGemini({ apiKey, model, body, startedAt }) {
-  const TOTAL = 25000;
-  const PER_TRY = 12000;
+  const TOTAL = 22000;
+  const PER_TRY = 9000;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   let lastStatus = 0;
   let lastData = null;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     const remaining = TOTAL - (Date.now() - startedAt);
     if (remaining < 3000) break;
     const controller = new AbortController();
@@ -80,12 +92,14 @@ async function callGemini({ apiKey, model, body, startedAt }) {
       clearTimeout(timer);
       lastStatus = 503;
     }
-    await sleep(1000 * (attempt + 1));
+    await sleep(1000);
   }
   return { ok: false, data: lastData, status: lastStatus };
 }
 
 const textOf = (data) => data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+
+const NOT_FOUND = 'السؤال ده مش موجود في قاعدة البيانات. جرب تكتبه بنفس صيغة الكتاب، أو صوّره بوضوح.';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -96,71 +110,61 @@ export default async function handler(req, res) {
     const apiKey = process.env.GEMINI_API_KEY;
     const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
-    // 1) نص فقط: جرب المطابقة المحلية أولاً (فورية ولا تحتاج Gemini)
-    if (questionText && !imageBase64) {
-      const hit = localMatch(questionText);
-      if (hit) return res.status(200).json({ answer: formatAnswer(hit), source: 'database' });
+    // 1) نص فقط: مطابقة محلية فورية بدون Gemini
+    let local = { best: null, score: 0, margin: 0 };
+    if (questionText) {
+      local = rank(questionText);
+      if (!imageBase64 && local.best && local.score >= 0.6 && local.margin >= 0.1) {
+        return res.status(200).json({ answer: formatAnswer(local.best), source: 'database' });
+      }
     }
 
-    if (!apiKey) {
-      return res.status(500).json({ error: 'مفتاح GEMINI_API_KEY غير مضاف في إعدادات Vercel.' });
-    }
+    // 2) جرب Gemini لتحديد رقم السؤال (بدون أي إجابة من عنده)
+    if (apiKey) {
+      const userParts = [];
+      if (questionText) userParts.push({ text: `نص السؤال: ${questionText}` });
+      if (imageBase64) userParts.push({ inlineData: { data: imageBase64, mimeType: mimeType || 'image/jpeg' } });
 
-    const userParts = [];
-    if (questionText) userParts.push({ text: `نص السؤال: ${questionText}` });
-    if (imageBase64) userParts.push({ inlineData: { data: imageBase64, mimeType: mimeType || 'image/jpeg' } });
-
-    // 2) اطلب من Gemini تحديد رقم السؤال من القائمة
-    const list = ALL.map((x) => `${x.id}: ${x.q}`).join('\n');
-    const matchPrompt = `لديك قائمة أسئلة مرقمة. اقرأ السؤال المرسل (نصاً أو صورة) وحدد رقم السؤال الذي يطابقه في القائمة.
-أجب بصيغة JSON فقط: {"id": رقم} أو {"id": null} إذا لم يوجد سؤال مطابق بوضوح. لا تخمن.
+      const list = ALL.map((x) => `${x.id}: ${x.q}`).join('\n');
+      const matchPrompt = `لديك قائمة أسئلة مرقمة. اقرأ السؤال المرسل (نصاً أو صورة) وحدد رقم أقرب سؤال يطابقه في القائمة من حيث الموضوع.
+أجب بصيغة JSON فقط: {"id": رقم} أو {"id": null} إذا لم يوجد سؤال مرتبط.
 
 القائمة:
 ${list}`;
 
-    const matchRes = await callGemini({
-      apiKey,
-      model,
-      startedAt,
-      body: {
-        contents: [{ parts: [{ text: matchPrompt }, ...userParts] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0 },
-      },
-    });
+      const matchRes = await callGemini({
+        apiKey,
+        model,
+        startedAt,
+        body: {
+          contents: [{ parts: [{ text: matchPrompt }, ...userParts] }],
+          generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+        },
+      });
 
-    if (matchRes.ok) {
-      let id = null;
-      try {
-        id = JSON.parse(textOf(matchRes.data)).id;
-      } catch {}
-      const item = ALL.find((x) => x.id === id);
-      if (item) return res.status(200).json({ answer: formatAnswer(item), source: 'database' });
+      if (matchRes.ok) {
+        let id = null;
+        try {
+          id = JSON.parse(textOf(matchRes.data)).id;
+        } catch {}
+        const item = ALL.find((x) => x.id === id);
+        if (item) return res.status(200).json({ answer: formatAnswer(item), source: 'database' });
+        return res.status(200).json({ answer: NOT_FOUND, source: 'database' });
+      }
     }
 
-    // 3) السؤال غير موجود في القاعدة: حل بالاعتماد على الدرس
-    const lessonPrompt = `
-أنت معلم تاريخ خبير لمنهج الصف الأول الثانوي المصري (الترم الأول - الدرس الثاني: الحياة الاقتصادية في مصر القديمة).
-حل السؤال الموجود في الصورة أو النص بدقة، والتزم بالمعلومات الواردة في الدرس حصرياً (الزراعة، الملكية، مشروعات الري كدولة وسطى وسد اللاهون وقناة سيزوستريس، الصناعة، التجارة الداخلية والخارجية مع فينيقيا وليبيا والنوبة وبلاد بونت).
-نسق إجابتك:
-✅ الإجابة الصحيحة: ...
-📖 التفسير الدقيق من الدرس: ...`;
-
-    const solveRes = await callGemini({
-      apiKey,
-      model,
-      startedAt,
-      body: { contents: [{ parts: [{ text: lessonPrompt }, ...userParts] }] },
-    });
-
-    if (!solveRes.ok) {
-      const busy = [0, 429, 503].includes(solveRes.status);
-      return res.status(busy ? 503 : 500).json({
-        error: busy ? 'السيرفر مزدحم حالياً، جرب مرة تانية بعد ثواني.' : solveRes.data?.error?.message || 'خطأ في الاتصال بـ Gemini API',
+    // 3) Gemini فشل أو مفيش مفتاح: استخدم أقرب سؤال من القاعدة (لو في تطابق معقول)
+    if (local.best && local.score >= 0.25 && local.margin >= 0.1) {
+      return res.status(200).json({
+        answer: formatAnswer(local.best, '⚠️ ده أقرب سؤال لقيته في قاعدة البيانات، تأكد إنه نفس سؤالك:'),
+        source: 'database-closest',
       });
     }
 
-    const answer = textOf(solveRes.data) || 'لم أتمكن من قراءة السؤال، جرب تقريب الكاميرا من السؤال.';
-    return res.status(200).json({ answer, source: 'ai' });
+    if (imageBase64) {
+      return res.status(503).json({ error: 'السيرفر مزدحم حالياً، جرب مرة تانية بعد ثواني، أو اكتب السؤال نصاً.' });
+    }
+    return res.status(200).json({ answer: NOT_FOUND, source: 'database' });
   } catch (e) {
     return res.status(500).json({ error: 'حدث خطأ داخلي في السيرفر.' });
   }
