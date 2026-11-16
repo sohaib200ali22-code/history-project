@@ -51,6 +51,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'حدث خطأ داخلي في السيرفر.' });
   }
 }
-```[cite: 1, 2, 7]
-
-حط الكود ده جوه `api/solve.js`[cite: 6] واعمل Deploy، وهتشتغل معاك وتظبط على طول يا بطل! طمني فوراً أول ما تجربها.
