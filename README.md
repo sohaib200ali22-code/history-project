@@ -4,7 +4,6 @@
 
 🔗 **رابط معاينة الموقع (Live Demo):**  
 [اضغط هنا لزيارة الموقع][([https://sohaib200ali22.github.io/history-project/](https://github.com/sohaib200ali22-code/history-project))
-](https://github.com/sohaib200ali22-code/history-project)
 ---
 
 ## ✨ مميزات المشروع
