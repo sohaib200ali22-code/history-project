@@ -1,5 +1,5 @@
 export const config = {
-  maxDuration: 30, // gives retries room on Vercel; remove if your plan rejects it
+  maxDuration: 30,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,19 +37,17 @@ export default async function handler(req, res) {
       });
     }
 
-    // Primary model first, then a fallback.
-    // Change the fallback to any model name that appears in your account's model list.
-    const models = [
-      process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-      process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash',
-    ];
+    // Main model first. A fallback is used ONLY if you set GEMINI_FALLBACK_MODEL in Vercel.
+    const models = [process.env.GEMINI_MODEL || 'gemini-3.8-flash'];
+    if (process.env.GEMINI_FALLBACK_MODEL) models.push(process.env.GEMINI_FALLBACK_MODEL);
 
-    let response;
+    let firstFailure = null; // keep the main model's error so a bad fallback can't hide it
     let data;
+    let ok = false;
 
     outer: for (const model of models) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        response = await fetch(
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
           {
             method: 'POST',
@@ -59,21 +57,27 @@ export default async function handler(req, res) {
         );
         data = await response.json();
 
-        if (response.ok) break outer;
+        if (response.ok) {
+          ok = true;
+          break outer;
+        }
 
-        // Retry only on temporary errors (rate limit / overload / server error)
-        if (![429, 500, 503].includes(response.status)) break outer;
+        if (!firstFailure) firstFailure = { status: response.status, data };
+
+        const temporary = [429, 500, 503].includes(response.status);
+        if (!temporary) break; // not temporary: skip to the next model
 
         await sleep(1000 * (attempt + 1));
       }
     }
 
-    if (!response.ok) {
-      const busy = [429, 503].includes(response.status);
+    if (!ok) {
+      const status = firstFailure?.status;
+      const busy = [429, 503].includes(status);
       return res.status(busy ? 503 : 500).json({
         error: busy
           ? 'السيرفر مزدحم حالياً، جرب مرة تانية بعد ثواني.'
-          : data?.error?.message || 'خطأ في الاتصال بـ Gemini API',
+          : firstFailure?.data?.error?.message || 'خطأ في الاتصال بـ Gemini API',
       });
     }
 
