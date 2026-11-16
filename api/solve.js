@@ -1,4 +1,4 @@
-import { MCQ, ESSAY } from './_questions.js';
+import { MCQ, ESSAY, REVIEW } from './_questions.js';
 
 export const config = { maxDuration: 30 };
 
@@ -26,11 +26,12 @@ const tokens = (s) =>
     .filter((w) => w.length > 1 && !STOP.has(w))
     .map(stem);
 
-const ALL = [...MCQ, ...ESSAY];
+const ALL = [...MCQ, ...ESSAY, ...REVIEW];
+const GEMINI_QUESTIONS = ALL;
 const INDEX = ALL.map((item) => ({
   item,
-  stemSet: new Set(tokens(item.q)),
-  fullSet: new Set(tokens(item.q + ' ' + (item.o ? item.o.join(' ') : ''))),
+  stemSet: new Set(tokens([item.q, ...(item.aliases || [])].join(' '))),
+  fullSet: new Set(tokens([item.q, ...(item.aliases || []), ...(item.o || [])].join(' '))),
 }));
 
 // يرجع أفضل سؤال مع درجة التطابق وفرقها عن الثاني
@@ -56,11 +57,13 @@ function rank(text) {
 
 function formatAnswer(item, note = '') {
   const head = note ? `${note}\n\n` : '';
+  const label = item.displayId || item.id;
+  const explanation = item.why ? `\n\n🧠 التفسير: ${item.why}` : '';
   if (item.o) {
     const i = item.a;
-    return `${head}❓ السؤال (${item.id}): ${item.q}\n\n✅ الإجابة الصحيحة: ${LETTERS[i]}) ${item.o[i]}`;
+    return `${head}❓ السؤال (${label}): ${item.q}\n\n✅ الإجابة الصحيحة: ${LETTERS[i]}) ${item.o[i]}${explanation}`;
   }
-  return `${head}❓ السؤال (${item.id}): ${item.q}\n\n✅ الإجابة النموذجية:\n${item.ans}`;
+  return `${head}❓ السؤال (${label}): ${item.q}\n\n✅ الإجابة النموذجية:\n${item.ans}`;
 }
 
 // ---------- استدعاء Gemini (لتحديد رقم السؤال فقط) ----------
@@ -122,18 +125,35 @@ export default async function handler(req, res) {
 
   const startedAt = Date.now();
   try {
-    const { imageBase64, mimeType, questionText } = req.body || {};
+    const { imageBase64, mimeType, questionText, ocrText, localOnly = false } = req.body || {};
     const apiKey = process.env.GEMINI_API_KEY;
     const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
     let geminiStatus = null;
 
-    // 1) نص فقط: مطابقة محلية فورية بدون Gemini
+    // 1) طابق النص المكتوب أو المستخرج محلياً أولاً.
     let local = { best: null, score: 0, margin: 0 };
     if (questionText) {
       local = rank(questionText);
-      if (!imageBase64 && local.best && local.score >= 0.6 && local.margin >= 0.1) {
-        return res.status(200).json({ answer: formatAnswer(local.best), source: 'database' });
+    }
+    if (ocrText) {
+      const ocrMatch = rank(ocrText);
+      if (!local.best || ocrMatch.score > local.score) local = ocrMatch;
+    }
+    if (!imageBase64 && local.best && local.score >= 0.6 && local.margin >= 0.1) {
+      return res.status(200).json({ answer: formatAnswer(local.best), source: 'database' });
+    }
+
+    // الصور التي يقرأها المتصفح لا تُرسل إلى Gemini؛ استخدم البنك المحلي فقط.
+    if (localOnly) {
+      if (local.best && local.score >= 0.25 && local.margin >= 0.1) {
+        return res.status(200).json({
+          answer: formatAnswer(local.best, '⚠️ ده أقرب سؤال لقيته في قاعدة الأسئلة المحلية، تأكد إنه نفس سؤالك:'),
+          source: 'database-closest',
+        });
       }
+      return res.status(200).json({
+        error: 'لم أتعرف على السؤال محلياً. قصّ الصورة حول سؤال واحد يظهر معه النص والاختيارات، أو اكتب نصه.',
+      });
     }
 
     // 2) جرب Gemini لتحديد رقم السؤال (بدون أي إجابة من عنده)
@@ -142,7 +162,7 @@ export default async function handler(req, res) {
       if (questionText) userParts.push({ text: `نص السؤال: ${questionText}` });
       if (imageBase64) userParts.push({ inlineData: { data: imageBase64, mimeType: mimeType || 'image/jpeg' } });
 
-      const list = ALL.map((x) => `${x.id}: ${x.q}`).join('\n');
+      const list = GEMINI_QUESTIONS.map((x) => `${x.id}: ${x.q}`).join('\n');
       const matchPrompt = `لديك قائمة أسئلة مرقمة. اقرأ السؤال المرسل (نصاً أو صورة) وحدد رقم أقرب سؤال يطابقه في القائمة من حيث الموضوع.
 أجب بصيغة JSON فقط: {"id": رقم} أو {"id": null} إذا لم يوجد سؤال مرتبط.
 
@@ -164,7 +184,7 @@ ${list}`;
         try {
           id = JSON.parse(textOf(matchRes.data)).id;
         } catch {}
-        const item = ALL.find((x) => x.id === id);
+        const item = GEMINI_QUESTIONS.find((x) => x.id === id);
         if (item) return res.status(200).json({ answer: formatAnswer(item), source: 'database' });
         return res.status(200).json({ answer: NOT_FOUND, source: 'database' });
       }

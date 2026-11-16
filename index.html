@@ -404,7 +404,7 @@
                 <i class="fa-solid fa-wand-magic-sparkles"></i> ميزة "أعرف الحل" الذكية
             </h2>
             <p style="color:var(--muted); max-width:580px; margin:0 auto 18px; font-size:0.95rem;">
-                صوّر أي سؤال من كتاب الامتحان بكاميرا الموبايل أو ارفعه من الجهاز (أو اكتبه)، وسيتم تحليله وحلّه بدقة بناءً على الدرس فوراً!
+                ابحث عن إجابة السؤال في بنك الدرس المحلي. عند رفع صورة، تُقرأ على جهازك ولا تُرسل إلى Gemini.
             </p>
 
             <input type="text" id="qTextInput" class="text-input-box" placeholder="اكتب نص السؤال هنا (أو ارفع صورته بالأسفل)...">
@@ -412,15 +412,16 @@
             <div class="drop-zone" onclick="document.getElementById('fileInput').click()">
                 <i class="fa-solid fa-camera-retro fa-2x" style="color:var(--gold); margin-bottom:8px;"></i>
                 <p style="font-weight:700; font-size:0.95rem;">اضغط لالتقاط صورة السؤال أو اختيارها من الاستوديو</p>
+                <p style="font-size:0.82rem; color:var(--muted);">لأفضل نتيجة، قصّ الصورة حول سؤال واحد مع الاختيارات.</p>
                 <input type="file" id="fileInput" accept="image/*" style="display:none;" onchange="processAndCompressImage(event)">
                 <img id="previewImg" alt="معاينة الصورة">
             </div>
 
-            <button class="btn-primary" onclick="solveWithGemini()"><i class="fa-solid fa-bolt"></i> اعرف الحل الآن</button>
+            <button class="btn-primary" onclick="solveFromQuestionBank()"><i class="fa-solid fa-bolt"></i> اعرف الحل الآن</button>
 
             <div id="solverLoader" style="display:none; margin-top:20px; color:var(--gold);">
                 <i class="fa-solid fa-spinner fa-spin fa-2x"></i>
-                <p style="margin-top:8px; font-size:0.95rem;">جاري قراءة السؤال واستخراج الإجابة النموذجية...</p>
+                <p id="solverStatus" style="margin-top:8px; font-size:0.95rem;">جاري قراءة السؤال واستخراج الإجابة النموذجية...</p>
             </div>
 
             <div class="ai-output" id="aiOutput"></div>
@@ -626,12 +627,81 @@
         }
         selectEra('old');
 
-        // 5. Image Compression & Gemini API Solver
-        let compressedBase64 = null;
+        // 5. On-device Arabic OCR and local question-bank lookup
+        let compressedImageDataUrl = null;
+        let arabicOcrWorkerPromise = null;
+        let tesseractScriptPromise = null;
+
+        function setSolverStatus(message) {
+            const status = document.getElementById('solverStatus');
+            if (status) status.textContent = message;
+        }
+
+        function loadTesseract() {
+            if (window.Tesseract) return Promise.resolve(window.Tesseract);
+            if (!tesseractScriptPromise) {
+                tesseractScriptPromise = new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+                    script.async = true;
+                    script.onload = () => resolve(window.Tesseract);
+                    script.onerror = () => {
+                        tesseractScriptPromise = null;
+                        reject(new Error('تعذر تحميل قارئ الصور.'));
+                    };
+                    document.head.appendChild(script);
+                });
+            }
+            return tesseractScriptPromise;
+        }
+
+        async function getArabicOcrWorker() {
+            const tesseract = await loadTesseract();
+            if (!tesseract?.createWorker) throw new Error('قارئ الصور غير متاح.');
+
+            if (!arabicOcrWorkerPromise) {
+                arabicOcrWorkerPromise = tesseract.createWorker('ara', 1, {
+                    logger: (message) => {
+                        const percent = Math.round((message.progress || 0) * 100);
+                        if (message.status === 'recognizing text') {
+                            setSolverStatus(`جاري قراءة السؤال... ${percent}%`);
+                        } else if (message.status === 'loading language traineddata') {
+                            setSolverStatus('جاري تحميل قارئ اللغة العربية لأول مرة...');
+                        } else {
+                            setSolverStatus('جاري تجهيز قارئ الصور...');
+                        }
+                    }
+                }).catch((error) => {
+                    arabicOcrWorkerPromise = null;
+                    throw error;
+                });
+            }
+
+            return arabicOcrWorkerPromise;
+        }
+
+        function prepareImageForOcr(dataUrl) {
+            return new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => {
+                    const scale = Math.max(1, Math.min(2, 1800 / Math.max(image.width, image.height)));
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.round(image.width * scale);
+                    canvas.height = Math.round(image.height * scale);
+                    const context = canvas.getContext('2d');
+                    context.filter = 'grayscale(1) contrast(1.25)';
+                    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                    resolve(canvas.toDataURL('image/png'));
+                };
+                image.onerror = () => reject(new Error('تعذر تجهيز الصورة للقراءة.'));
+                image.src = dataUrl;
+            });
+        }
 
         function processAndCompressImage(e) {
             const file = e.target.files[0];
             if (!file) return;
+            compressedImageDataUrl = null;
 
             const reader = new FileReader();
             reader.onload = (event) => {
@@ -650,16 +720,16 @@
                     const preview = document.getElementById('previewImg');
                     preview.src = dataUrl;
                     preview.style.display = 'block';
-                    compressedBase64 = dataUrl.split(',')[1];
+                    compressedImageDataUrl = dataUrl;
                 };
                 img.src = event.target.result;
             };
             reader.readAsDataURL(file);
         }
 
-        async function solveWithGemini() {
-            const qText = document.getElementById('qTextInput').value.trim();
-            if (!compressedBase64 && !qText) {
+        async function solveFromQuestionBank() {
+            const typedText = document.getElementById('qTextInput').value.trim();
+            if (!compressedImageDataUrl && !typedText) {
                 alert('الرجاء رفع صورة السؤال أو كتابة نص السؤال أولاً!');
                 return;
             }
@@ -670,12 +740,32 @@
             output.style.display = 'none';
 
             try {
+                let ocrText = '';
+                if (compressedImageDataUrl) {
+                    setSolverStatus('جاري تجهيز قارئ الصور...');
+                    try {
+                        const worker = await getArabicOcrWorker();
+                        const ocrImage = await prepareImageForOcr(compressedImageDataUrl);
+                        const result = await worker.recognize(ocrImage);
+                        ocrText = (result.data.text || '').trim();
+                    } catch (ocrError) {
+                        if (!typedText) throw ocrError;
+                        console.warn('Arabic OCR unavailable', { errorName: ocrError?.name || 'Error' });
+                    }
+
+                    if (!ocrText && !typedText) {
+                        throw new Error('لم أتمكن من قراءة نص السؤال. قصّ الصورة بشكل أوضح أو اكتبه هنا.');
+                    }
+                }
+
+                setSolverStatus('جاري البحث في قاعدة الأسئلة المحلية...');
                 const res = await fetch('/api/solve', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        imageBase64: compressedBase64,
-                        questionText: qText
+                        questionText: typedText,
+                        ocrText,
+                        localOnly: Boolean(compressedImageDataUrl)
                     })
                 });
 
@@ -691,7 +781,7 @@
             } catch (err) {
                 loader.style.display = 'none';
                 output.style.display = 'block';
-                output.innerHTML = `<p style="color:#f87171;">تعذر الاتصال بالسيرفر، تأكد من رفع الموقع على Vercel وإضافة GEMINI_API_KEY.</p>`;
+                output.innerHTML = `<p style="color:#f87171;">${err?.message || 'تعذر الاتصال بالسيرفر. تحقق من الاتصال ثم حاول مرة أخرى.'}</p>`;
             }
         }
 
