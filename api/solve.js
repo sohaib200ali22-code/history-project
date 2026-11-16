@@ -9,6 +9,10 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  const startedAt = Date.now();
+  const TOTAL_BUDGET_MS = 25000; // stay under the 30s Vercel limit
+  const PER_TRY_MS = 12000;      // max time for a single Gemini call
+
   try {
     const { imageBase64, mimeType, questionText } = req.body;
     const apiKey = process.env.GEMINI_API_KEY;
@@ -30,54 +34,55 @@ export default async function handler(req, res) {
     if (questionText) parts.push({ text: `نص السؤال: ${questionText}` });
     if (imageBase64) {
       parts.push({
-        inlineData: {
-          data: imageBase64,
-          mimeType: mimeType || 'image/jpeg',
-        },
+        inlineData: { data: imageBase64, mimeType: mimeType || 'image/jpeg' },
       });
     }
 
-    // Main model first. A fallback is used ONLY if you set GEMINI_FALLBACK_MODEL in Vercel.
-    const models = [process.env.GEMINI_MODEL || 'gemini-3.8-flash'];
-    if (process.env.GEMINI_FALLBACK_MODEL) models.push(process.env.GEMINI_FALLBACK_MODEL);
+    const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    let firstFailure = null; // keep the main model's error so a bad fallback can't hide it
-    let data;
+    let data = null;
+    let lastStatus = 0;
     let ok = false;
 
-    outer: for (const model of models) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts }] }),
-          }
-        );
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
+      if (remaining < 3000) break; // not enough time for another try
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.min(PER_TRY_MS, remaining));
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts }] }),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+
+        lastStatus = response.status;
         data = await response.json();
 
         if (response.ok) {
           ok = true;
-          break outer;
+          break;
         }
-
-        if (!firstFailure) firstFailure = { status: response.status, data };
-
-        const temporary = [429, 500, 503].includes(response.status);
-        if (!temporary) break; // not temporary: skip to the next model
-
-        await sleep(1000 * (attempt + 1));
+        if (![429, 500, 503].includes(response.status)) break; // permanent error
+      } catch (err) {
+        clearTimeout(timer);
+        lastStatus = 503; // timed out or network error: treat as busy
       }
+
+      await sleep(1000 * (attempt + 1));
     }
 
     if (!ok) {
-      const status = firstFailure?.status;
-      const busy = [429, 503].includes(status);
+      const busy = [0, 429, 503].includes(lastStatus);
       return res.status(busy ? 503 : 500).json({
         error: busy
           ? 'السيرفر مزدحم حالياً، جرب مرة تانية بعد ثواني.'
-          : firstFailure?.data?.error?.message || 'خطأ في الاتصال بـ Gemini API',
+          : data?.error?.message || 'خطأ في الاتصال بـ Gemini API',
       });
     }
 
