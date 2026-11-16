@@ -26,7 +26,7 @@ export default async function handler(req, res) {
       parts.push({
         inlineData: {
           data: imageBase64,
-          mimeType: 'image/jpeg'
+          mimeType: mimeType || 'image/jpeg'
         }
       });
     }
@@ -45,12 +45,9 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: data.error?.message || 'خطأ في الاتصال بـ Gemini API' });
     }
 
-    const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text || 'لم أتمكن من قراءة السؤال، جرب تقريب الكاميرا من السؤال.';
+    const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text || 'لم أتمكن من قراءة السؤال، جرب تقريب الكاميرا من السؤال و توفير إضائة جيدة.';
     return res.status(200).json({ answer });
   } catch (error) {
     return res.status(500).json({ error: 'حدث خطأ داخلي في السيرفر.' });
   }
 }
-```[cite: 1, 2]
-
-جرب الكود ده دلوقتي واعمل Deploy على Vercel، وهتشتغل معاك زي الحلاوة فوراً يا بطل! لو واجهتك أي حاجة أنا معاك.
